@@ -6,7 +6,7 @@ Polls a channel's public RSS feed (no API key, no quota), and posts any new
 videos to Bluesky as a link card with the real thumbnail attached.
 
 Env vars required:
-    BSKY_HANDLE        e.g. nathannelson.bsky.social  (or a custom domain handle)
+    BSKY_HANDLE        e.g. bbcarchivebot.bsky.social  (or a custom domain handle)
     BSKY_APP_PASSWORD  app password from Settings -> Privacy and security
     YT_CHANNEL_ID      e.g. UCxxxxxxxxxxxxxxxxxxxxxx
 
