@@ -6,7 +6,7 @@ Polls a channel's public RSS feed (no API key, no quota), and posts any new
 videos to Bluesky as a link card with the real thumbnail attached.
 
 Env vars required:
-    BSKY_HANDLE        e.g. bbcarchivebot.bsky.social  (or a custom domain handle)
+    BSKY_HANDLE        e.g. nathannelson.bsky.social  (or a custom domain handle)
     BSKY_APP_PASSWORD  app password from Settings -> Privacy and security
     YT_CHANNEL_ID      e.g. UCxxxxxxxxxxxxxxxxxxxxxx
 
@@ -37,6 +37,32 @@ NS = {
     "yt": "http://www.youtube.com/xml/schemas/2015",
     "media": "http://search.yahoo.com/mrss/",
 }
+
+
+class TransientError(Exception):
+    """A network problem we expect to pass on its own. Signals the run should
+    exit cleanly and let the next cron tick retry, rather than fail loudly."""
+
+
+def get_with_retries(url: str, attempts: int = 4, timeout: int = 30) -> requests.Response:
+    """GET with exponential backoff on transient failures (resets, timeouts,
+    5xx). Raises TransientError if every attempt fails."""
+    backoff = 2.0
+    last = None
+    for i in range(1, attempts + 1):
+        try:
+            r = requests.get(url, timeout=timeout)
+            # 5xx and 429 are worth retrying; 4xx (except 429) are not.
+            if r.status_code >= 500 or r.status_code == 429:
+                raise requests.HTTPError(f"status {r.status_code}", response=r)
+            return r
+        except (requests.ConnectionError, requests.Timeout, requests.HTTPError) as e:
+            last = e
+            if i < attempts:
+                sleep = backoff ** i
+                print(f"  attempt {i}/{attempts} failed ({e}); retrying in {sleep:.0f}s")
+                time.sleep(sleep)
+    raise TransientError(f"{url} failed after {attempts} attempts: {last}")
 
 # Bluesky rejects blobs over ~976 KB. Leave headroom.
 MAX_BLOB_BYTES = 900_000
@@ -119,7 +145,7 @@ def truncate(text: str, limit: int = POST_LIMIT) -> str:
 # --------------------------------------------------------------------------
 
 def fetch_feed(channel_id: str) -> tuple[str, list[dict]]:
-    r = requests.get(FEED_URL.format(channel_id), timeout=30)
+    r = get_with_retries(FEED_URL.format(channel_id))
     r.raise_for_status()
     root = ET.fromstring(r.content)
 
@@ -163,8 +189,8 @@ def fetch_thumbnail(video_id: str) -> bytes | None:
     for name in THUMB_CANDIDATES:
         url = f"https://i.ytimg.com/vi/{video_id}/{name}.jpg"
         try:
-            r = requests.get(url, timeout=30)
-        except requests.RequestException:
+            r = get_with_retries(url, attempts=2)
+        except (requests.RequestException, TransientError):
             continue
         # YouTube returns a 120x90 grey placeholder rather than a 404 for
         # missing sizes, so check the payload is a plausible size too.
@@ -251,7 +277,14 @@ def main() -> int:
     state = load_state(state_path)
     seen = set(state["seen"])
 
-    channel_name, videos = fetch_feed(channel_id)
+    try:
+        channel_name, videos = fetch_feed(channel_id)
+    except TransientError as e:
+        # Couldn't reach YouTube. Nothing was posted and state is untouched,
+        # so just bow out cleanly; the next scheduled run will try again.
+        print(f"Feed unreachable, skipping this run: {e}", file=sys.stderr)
+        return 0
+
     new = [v for v in videos if v["id"] not in seen]
 
     if not state["initialised"]:
@@ -271,7 +304,15 @@ def main() -> int:
     client = None
     if not dry_run:
         client = Client()
-        client.login(handle, app_password)
+        try:
+            client.login(handle, app_password)
+        except Exception as e:
+            # Could be a transient Bluesky outage or a bad credential. Either
+            # way, don't post a partial batch. Exit clean so state is preserved
+            # and the next run retries; if it's a credential problem, the logs
+            # will show a consistent failure to investigate.
+            print(f"Bluesky login failed, skipping this run: {e}", file=sys.stderr)
+            return 0
 
     for v in new:
         cleaned = clean_title(v["title"], channel_name)
